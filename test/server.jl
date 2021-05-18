@@ -255,20 +255,108 @@ end
     # Shutdown adds 1
     TEST_COUNT = Ref(0)
     shutdown_add() = TEST_COUNT[] += 1
-    server = HTTP.Servers.Server(nothing, IOserver, "host", "port", shutdown_add)
+    server = HTTP.Servers.Server(nothing, IOserver, "host", "port", shutdown_add, nothing)
     close(server)
 
     # Shutdown adds 1, performed twice
     @test TEST_COUNT[] == 1
-    server = HTTP.Servers.Server(nothing, IOserver, "host", "port", [shutdown_add, shutdown_add])
+    server = HTTP.Servers.Server(nothing, IOserver, "host", "port", [shutdown_add, shutdown_add], nothing)
     close(server)
     @test TEST_COUNT[] == 3
 
     # First shutdown function errors, second adds 1
     shutdown_throw() = throw(ErrorException("Broken"))
-    server = HTTP.Servers.Server(nothing, IOserver, "host", "port", [shutdown_throw, shutdown_add])
+    server = HTTP.Servers.Server(nothing, IOserver, "host", "port", [shutdown_throw, shutdown_add], nothing)
     @test_logs (:error, r"shutdown function .* failed") close(server)
     @test TEST_COUNT[] == 4
 end # @testset
+
+@testset "access logging" begin
+    start = Libc.TmStruct(time())
+    function handler(http)
+        HTTP.setstatus(http, 200)
+        HTTP.setheader(http, "Content-Type" => "text/plain")
+        msg = "hello, world"
+        HTTP.setheader(http, "Content-Length" => string(sizeof(msg)))
+        HTTP.startwrite(http)
+        if http.message.method == "GET"
+            HTTP.write(http, msg)
+        end
+    end
+    function with_testserver(f, fmt)
+        l = Sockets.listen(ip"0.0.0.0", 8090)
+        logger = Test.TestLogger()
+        global tsk = @async begin
+            Base.CoreLogging.with_logger(logger) do
+                HTTP.listen(handler, Sockets.localhost, 8090; server=l, access_log=fmt)
+            end
+        end
+        try
+            f()
+        finally
+            close(l)
+        end
+        return logger.logs
+    end
+
+    # Common Log Format
+    logs = with_testserver(HTTP.common_logfmt) do
+        HTTP.get("http://localhost:8090")
+        HTTP.get("http://localhost:8090/index.html")
+        HTTP.get("http://localhost:8090/index.html?a=b")
+        HTTP.head("http://localhost:8090")
+    end
+    @test length(logs) == 4
+    @test all(x -> x.group === :access_log, logs)
+    @test all(x -> startswith(x.message, "127.0.0.1 - - ["), logs)
+    @test all(logs) do x
+        str = String(match(r"\[(.*)\]", x.message)[1])
+        t = Libc.strptime("%d/%b/%Y:%H:%M:%S %z", str)
+        t.year == start.year
+    end
+    @test occursin(r"\"GET / HTTP/1.1\" 200 12$", logs[1].message)
+    @test occursin(r"\"GET /index.html HTTP/1.1\" 200 12$", logs[2].message)
+    @test occursin(r"\"GET /index.html\?a=b HTTP/1.1\" 200 12$", logs[3].message)
+    @test occursin(r"\"HEAD / HTTP/1.1\" 200 0$", logs[4].message)
+
+    # Combined Log Format
+    logs = with_testserver(HTTP.combined_logfmt) do
+        HTTP.get("http://localhost:8090", ["Referer" => "julialang.org"])
+        HTTP.get("http://localhost:8090/index.html")
+        useragent = HTTP.MessageRequest.USER_AGENT[]
+        HTTP.setuseragent!(nothing)
+        HTTP.get("http://localhost:8090/index.html?a=b")
+        HTTP.setuseragent!(useragent)
+        HTTP.head("http://localhost:8090")
+    end
+    @test length(logs) == 4
+    @test all(x -> x.group === :access_log, logs)
+    @test all(x -> startswith(x.message, "127.0.0.1 - - ["), logs)
+    @test all(logs) do x
+        str = String(match(r"\[(.*)\]", x.message)[1])
+        t = Libc.strptime("%d/%b/%Y:%H:%M:%S %z", str)
+        t.year == start.year
+    end
+    @test occursin(r"\"GET / HTTP/1.1\" 200 12 \"julialang\.org\" \"HTTP\.jl/.*\"$", logs[1].message)
+    @test occursin(r"\"GET /index.html HTTP/1.1\" 200 12 \"-\" \"HTTP\.jl/.*\"$", logs[2].message)
+    @test occursin(r"\"GET /index.html\?a=b HTTP/1.1\" 200 12 \"-\" \"-\"$", logs[3].message)
+    @test occursin(r"\"HEAD / HTTP/1.1\" 200 0 \"-\" \"HTTP\.jl/.*\"$", logs[4].message)
+
+    # Custom log format
+    fmt = HTTP.logfmt"$http_accept $sent_http_content_type $request $request_method $request_uri $remote_addr $remote_port $remote_user $server_protocol $time_iso8601 $time_local $status $body_bytes_sent"
+    logs = with_testserver(fmt) do
+        HTTP.get("http://localhost:8090", ["Accept" => "application/json"])
+        HTTP.get("http://localhost:8090/index.html")
+        HTTP.get("http://localhost:8090/index.html?a=b")
+        HTTP.head("http://localhost:8090")
+    end
+    @test length(logs) == 4
+    @test all(x -> x.group === :access_log, logs)
+    @test occursin(r"^application/json text/plain GET / HTTP/1\.1 GET / 127\.0\.0\.1 \d+ - HTTP/1\.1 \d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\+|-)\d+ \d+/.*/\d{4}:\d{2}:\d{2}:\d{2} (\+|-)\d{4} 200 12$", logs[1].message)
+    @test occursin(r"^\*/\* text/plain GET /index\.html HTTP/1\.1 GET /index\.html 127\.0\.0\.1 \d+ - HTTP/1\.1 \d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\+|-)\d+ \d+/.*/\d{4}:\d{2}:\d{2}:\d{2} (\+|-)\d{4} 200 12$", logs[2].message)
+    @test occursin(r"^\*/\* text/plain GET /index\.html\?a=b HTTP/1\.1 GET /index\.html\?a=b 127\.0\.0\.1 \d+ - HTTP/1\.1 \d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\+|-)\d+ \d+/.*/\d{4}:\d{2}:\d{2}:\d{2} (\+|-)\d{4} 200 12$", logs[3].message)
+    @test occursin(r"^\*/\* text/plain HEAD / HTTP/1\.1 HEAD / 127\.0\.0\.1 \d+ - HTTP/1\.1 \d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\+|-)\d+ \d+/.*/\d{4}:\d{2}:\d{2}:\d{2} (\+|-)\d{4} 200 0$", logs[4].message)
+
+end
 
 end # module

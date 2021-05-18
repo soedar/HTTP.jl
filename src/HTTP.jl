@@ -26,6 +26,7 @@ end
 @noinline _length_assert() =  @assert false "0 < tid <= v"
 
 include("debug.jl")
+include("access_log.jl")
 
 include("Pairs.jl")                    ;using .Pairs
 include("IOExtras.jl")                 ;using .IOExtras

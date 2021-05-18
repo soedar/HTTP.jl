@@ -74,6 +74,7 @@ struct Server{S <: Union{SSLConfig, Nothing}, I <: Base.IOServer}
     hostname::String
     hostport::String
     on_shutdown::Any
+    access_log::Union{Function,Nothing}
 end
 
 Base.isopen(s::Server) = isopen(s.server)
@@ -143,6 +144,10 @@ Optional keyword arguments:
     allowed per client IP address; excess connections are immediately closed.
     e.g. 5//1.
  - `verbose::Bool=false`, log connection information to `stdout`.
+ - `access_log::Function`, function for formatting access log messages. The
+    function should accept two arguments, `io::IO` to which the messages should
+    be written, and `http::HTTP.Stream` which can be used to query information
+    from.
  - `on_shutdown::Union{Function, Vector{<:Function}, Nothing}=nothing`, one or
     more functions to be run if the server is closed (for example by an
     `InterruptException`). Note, shutdown function(s) will not run if a
@@ -234,6 +239,7 @@ function listen(f,
                 reuse_limit::Int=nolimit,
                 readtimeout::Int=0,
                 verbose::Bool=false,
+                access_log::Union{Function,Nothing}=nothing,
                 on_shutdown::Union{Function, Vector{<:Function}, Nothing}=nothing)
 
     inet = getinet(host, port)
@@ -262,7 +268,7 @@ function listen(f,
         x -> f(x) && check_rate_limit(x, rate_limit)
     end
 
-    s = Server(sslconfig, tcpserver, string(host), string(port), on_shutdown)
+    s = Server(sslconfig, tcpserver, string(host), string(port), on_shutdown, access_log)
     return listenloop(f, s, tcpisvalid, connection_count, max_connections,
                          reuse_limit, readtimeout, verbose)
 end
@@ -412,6 +418,9 @@ function handle_transaction(f, t::Transaction, server; final_transaction::Bool=f
         closeread(http)
         @debug 2 "server closewrite"
         closewrite(http)
+        if server.access_log !== nothing
+            @info sprint(server.access_log, http) _group=:access_log
+        end
     catch e
         @error "error handling request" exception=(e, stacktrace(catch_backtrace()))
         if isopen(http) && !iswritable(http)
